@@ -354,4 +354,98 @@ public class TsqlParserTests
             e.Callee.Name.Equals("[dbo].[NopeInBlock]", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public void Parse_WhenFromReferencesSingleTable_ShouldCaptureTableEdge()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.Proc
+        AS
+        BEGIN
+            SELECT * FROM dbo.Customers;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.Proc", result!.Definition.Name);
+        Assert.Equal(SqlObjectType.StoredProcedure, result.Definition.Type);
+
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("dbo.Customers", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
+
+    [Fact]
+    public void Parse_WhenFromAndJoinTablesWithQuotedIdentifiers_ShouldCaptureBothEdges()
+    {
+        var text = @"
+        CREATE VIEW [dbo].[vOrders]
+        AS
+        SELECT o.Id
+        FROM [dbo].[Orders] AS o
+        JOIN [dbo].[OrderLines] ol ON ol.OrderId = o.Id;";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("[dbo].[vOrders]", result!.Definition.Name);
+        Assert.Equal(SqlObjectType.View, result.Definition.Type);
+
+        Assert.Equal(2, result.Edges.Count);
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "[dbo].[Orders]" &&
+            e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "[dbo].[OrderLines]" &&
+            e.Callee.Type == SqlObjectType.Table);
+    }
+
+    [Fact]
+    public void Parse_WhenFromHasTvfAndJoinHasTable_ShouldClassifyTvfAndTableCorrectly()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.Proc
+        AS
+        BEGIN
+            SELECT *
+            FROM dbo.tvf_Items(123) it
+            JOIN dbo.Products p ON p.Id = it.ProductId;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.Proc", result!.Definition.Name);
+        Assert.Equal(SqlObjectType.StoredProcedure, result.Definition.Type);
+
+        // Expect 2 edges: TVF (UserFunction) + Table
+        Assert.Equal(2, result.Edges.Count);
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "dbo.tvf_Items" &&
+            e.Callee.Type == SqlObjectType.UserFunction);
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "dbo.Products" &&
+            e.Callee.Type == SqlObjectType.Table);
+    }
+
+    [Fact]
+    public void Parse_WhenFromLooksLikeFunctionNameWithoutParens_ShouldTreatAsTable()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.Proc
+        AS
+        BEGIN
+            SELECT * FROM dbo.MaybeFunc;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.Proc", result!.Definition.Name);
+        Assert.Equal(SqlObjectType.StoredProcedure, result.Definition.Type);
+
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("dbo.MaybeFunc", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
 }

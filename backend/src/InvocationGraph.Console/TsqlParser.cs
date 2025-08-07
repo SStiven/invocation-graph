@@ -37,6 +37,10 @@ public static class TsqlParser
         @"\b(?:NVARCHAR|VARCHAR|NCHAR|CHAR|VARBINARY|BINARY|DECIMAL|NUMERIC|FLOAT|REAL|TIME|DATETIME2|DATETIMEOFFSET)\s*\([^)]*\)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex FromJoinObjectRegex = new Regex(
+        $@"\b(?:FROM|JOIN)\s+(?<name>(?>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*))\s*(?!\s*\()",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public static ParsedFile? Parse(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
@@ -54,12 +58,17 @@ public static class TsqlParser
         var edges = new List<InvocationEdge>();
 
         edges.AddRange(GetExecEdges(clean, definition));
+
         var tvfNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         edges.AddRange(GetTvfEdges(clean, definition, tvfNames));
+
+        edges.AddRange(GetFromJoinTableEdges(clean, definition, tvfNames));
+
         edges.AddRange(GetScalarFunctionEdges(clean, definition, tvfNames));
 
         return new ParsedFile(definition, DedupeEdges(edges));
     }
+
 
     private static IEnumerable<InvocationEdge> GetExecEdges(string sql, SqlObject definition)
     {
@@ -136,5 +145,19 @@ public static class TsqlParser
     {
         return DataTypeWithParensRegex.Replace(sql, m =>
             Regex.Replace(m.Value, @"\s*\([^)]*\)", ""));
+    }
+
+    private static IEnumerable<InvocationEdge> GetFromJoinTableEdges(
+        string sql,
+        SqlObject definition,
+        HashSet<string> tvfNames)
+    {
+        foreach (Match m in FromJoinObjectRegex.Matches(sql))
+        {
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+            if (tvfNames.Contains(name)) continue;  // do not double-count TVFs as tables
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
+        }
     }
 }
