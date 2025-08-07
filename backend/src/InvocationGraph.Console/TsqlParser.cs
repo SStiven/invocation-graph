@@ -45,10 +45,7 @@ public static class TsqlParser
         clean = StripTypeParameterLists(clean);
 
         var defMatch = CreateRegex.Match(clean);
-        if (!defMatch.Success)
-        {
-            return null;
-        }
+        if (!defMatch.Success) return null;
 
         var defType = ParseType(defMatch.Groups[1].Value);
         var defName = defMatch.Groups["name"].Value;
@@ -56,40 +53,47 @@ public static class TsqlParser
 
         var edges = new List<InvocationEdge>();
 
-        // 1) EXEC → StoredProcedure
-        foreach (Match m in ExecRegex.Matches(clean))
-        {
-            var name = m.Groups["name"].Value;
-            if (IsSelfInvocation(definition, name)) continue;
-
-            var callee = new SqlObject(name, SqlObjectType.StoredProcedure);
-            edges.Add(new InvocationEdge(definition, callee));
-        }
-
-        // 2) TVFs → UserFunction, but also remember their names
+        edges.AddRange(GetExecEdges(clean, definition));
         var tvfNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match m in TableValuedFuncRegex.Matches(clean))
+        edges.AddRange(GetTvfEdges(clean, definition, tvfNames));
+        edges.AddRange(GetScalarFunctionEdges(clean, definition, tvfNames));
+
+        return new ParsedFile(definition, DedupeEdges(edges));
+    }
+
+    private static IEnumerable<InvocationEdge> GetExecEdges(string sql, SqlObject definition)
+    {
+        foreach (Match m in ExecRegex.Matches(sql))
         {
             var name = m.Groups["name"].Value;
             if (IsSelfInvocation(definition, name)) continue;
-
-            tvfNames.Add(name);
-            var callee = new SqlObject(name, SqlObjectType.UserFunction);
-            edges.Add(new InvocationEdge(definition, callee));
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.StoredProcedure));
         }
+    }
 
-        // 3) Scalar‐func calls → UserFunction, skip self and any TVF
-        foreach (Match m in ScalarFuncRegex.Matches(clean))
+    private static IEnumerable<InvocationEdge> GetTvfEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
+    {
+        foreach (Match m in TableValuedFuncRegex.Matches(sql))
         {
-            var calleeName = m.Groups["name"].Value;
-            if (IsSelfInvocation(definition, calleeName) || tvfNames.Contains(calleeName))
-                continue;
-
-            var callee = new SqlObject(calleeName, SqlObjectType.UserFunction);
-            edges.Add(new InvocationEdge(definition, callee));
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+            tvfNames.Add(name);
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.UserFunction));
         }
+    }
 
-        // 4) Dedupe edges (caller|type|callee)
+    private static IEnumerable<InvocationEdge> GetScalarFunctionEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
+    {
+        foreach (Match m in ScalarFuncRegex.Matches(sql))
+        {
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name) || tvfNames.Contains(name)) continue;
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.UserFunction));
+        }
+    }
+
+    private static List<InvocationEdge> DedupeEdges(IEnumerable<InvocationEdge> edges)
+    {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var unique = new List<InvocationEdge>();
         foreach (var e in edges)
@@ -97,8 +101,7 @@ public static class TsqlParser
             var key = $"{e.Caller.Name}|{e.Callee.Type}|{e.Callee.Name}";
             if (seen.Add(key)) unique.Add(e);
         }
-
-        return new ParsedFile(definition, unique);
+        return unique;
     }
 
     private static bool IsSelfInvocation(SqlObject definition, string candidateName)
