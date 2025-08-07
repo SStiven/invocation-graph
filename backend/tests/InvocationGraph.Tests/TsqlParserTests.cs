@@ -448,4 +448,148 @@ public class TsqlParserTests
         Assert.Equal("dbo.MaybeFunc", edge.Callee.Name);
         Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
     }
+
+    [Fact]
+    public void Parse_WhenInsertInto_ShouldCaptureTargetTable()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            INSERT INTO dbo.Target(Col) VALUES (1);
+        END";
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("dbo.Target", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
+
+    [Fact]
+    public void Parse_WhenInsertIntoSelectFrom_ShouldCaptureTargetAndSourceTables()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            INSERT INTO [dbo].[Target](Col)
+            SELECT Col FROM [dbo].[Source];
+        END";
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Edges.Count);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "[dbo].[Target]" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "[dbo].[Source]" && e.Callee.Type == SqlObjectType.Table);
+    }
+
+    [Fact]
+    public void Parse_WhenUpdateQualifiedTable_ShouldCaptureTargetTable()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            UPDATE dbo.Target SET Col = 1;
+        END";
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("dbo.Target", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
+
+    [Fact]
+    public void Parse_WhenUpdateUsesAliasWithFromJoin_ShouldCaptureTablesFromFromJoin()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            UPDATE t
+               SET t.Col = 1
+            FROM dbo.Target AS t
+            JOIN dbo.Source s ON s.Id = t.Id;
+        END";
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        // Expect both tables from the FROM/JOIN (Target + Source)
+        Assert.Equal(2, result.Edges.Count);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Target" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Source" && e.Callee.Type == SqlObjectType.Table);
+    }
+
+    [Fact]
+    public void Parse_WhenDeleteFrom_ShouldCaptureTargetTable()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            DELETE FROM [dbo].[Target] WHERE Id = 1;
+        END";
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("[dbo].[Target]", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
+
+    [Fact]
+    public void Parse_WhenIudAppearInCommentsOrStrings_ShouldNotCaptureEdges()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            -- INSERT INTO dbo.Nope VALUES (1);
+            /* UPDATE dbo.Nope SET Col = 1; */
+            SELECT 'DELETE FROM dbo.Nope';
+            SELECT 1;
+        END";
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Empty(result.Edges);
+    }
+
+    [Fact]
+    public void Parse_WhenInsertIntoWithColumnList_ShouldNotTreatTableAsFunction()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            INSERT INTO dbo.Target(Col) VALUES (1);
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("dbo.Target", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
+
+    [Fact]
+    public void Parse_WhenInsertValues_ShouldNotTreatValuesAsFunction()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            INSERT INTO [dbo].[T]([C]) VALUES (1);
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        var edge = Assert.Single(result.Edges);
+        Assert.Equal("[dbo].[T]", edge.Callee.Name);
+        Assert.Equal(SqlObjectType.Table, edge.Callee.Type);
+    }
 }
