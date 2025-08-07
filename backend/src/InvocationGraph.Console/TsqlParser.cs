@@ -74,7 +74,6 @@ public static class TsqlParser
         var definition = new SqlObject(defName, defType);
 
         var edges = new List<InvocationEdge>();
-
         var tvfNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         edges.AddRange(GetExecEdges(clean, definition));
@@ -167,16 +166,25 @@ public static class TsqlParser
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var unique = new List<InvocationEdge>();
+
         foreach (var e in edges)
         {
-            var key = $"{e.Caller.Name}|{e.Callee.Type}|{e.Callee.Name}";
-            if (seen.Add(key)) unique.Add(e);
+            var callerKey = CanonicalizeName(e.Caller.Name);
+            var calleeKey = CanonicalizeName(e.Callee.Name);
+            var key = $"{callerKey}|{e.Callee.Type}|{calleeKey}";
+
+            if (seen.Add(key))
+                unique.Add(e);
         }
+
         return unique;
     }
 
     private static bool IsSelfInvocation(SqlObject definition, string candidateName) =>
-        string.Equals(definition.Name, candidateName, StringComparison.OrdinalIgnoreCase);
+        string.Equals(
+            CanonicalizeName(definition.Name),
+            CanonicalizeName(candidateName),
+            StringComparison.OrdinalIgnoreCase);
 
     private static SqlObjectType ParseType(string token) =>
         token.ToUpperInvariant() switch
@@ -201,4 +209,27 @@ public static class TsqlParser
 
     private static string StripInsertColumnLists(string sql) =>
         InsertColumnListRegex.Replace(sql, "$1");
+
+    private static string CanonicalizeName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return string.Empty;
+
+        static string TrimQuotes(string part)
+        {
+            part = part.Trim();
+            if (part.Length >= 2)
+            {
+                if (part[0] == '[' && part[^1] == ']') return part[1..^1];
+                if (part[0] == '"' && part[^1] == '"') return part[1..^1];
+            }
+            return part;
+        }
+
+        var parts = name.Split('.', StringSplitOptions.RemoveEmptyEntries)
+                        .Select(TrimQuotes)
+                        .Select(p => p.Trim())
+                        .Where(p => p.Length > 0);
+
+        return string.Join(".", parts);
+    }
 }
