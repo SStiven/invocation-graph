@@ -33,11 +33,16 @@ public static class TsqlParser
     private static readonly Regex StringRegex = new Regex(
         @"'([^']|'')*'", RegexOptions.Singleline | RegexOptions.Compiled);
 
+    private static readonly Regex DataTypeWithParensRegex = new Regex(
+        @"\b(?:NVARCHAR|VARCHAR|NCHAR|CHAR|VARBINARY|BINARY|DECIMAL|NUMERIC|FLOAT|REAL|TIME|DATETIME2|DATETIMEOFFSET)\s*\([^)]*\)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public static ParsedFile? Parse(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
 
         var clean = StripCommentsAndStrings(text);
+        clean = StripTypeParameterLists(clean);
 
         var defMatch = CreateRegex.Match(clean);
         if (!defMatch.Success)
@@ -54,8 +59,10 @@ public static class TsqlParser
         // 1) EXEC → StoredProcedure
         foreach (Match m in ExecRegex.Matches(clean))
         {
-            var callee = new SqlObject(m.Groups["name"].Value,
-                                       SqlObjectType.StoredProcedure);
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+
+            var callee = new SqlObject(name, SqlObjectType.StoredProcedure);
             edges.Add(new InvocationEdge(definition, callee));
         }
 
@@ -64,28 +71,34 @@ public static class TsqlParser
         foreach (Match m in TableValuedFuncRegex.Matches(clean))
         {
             var name = m.Groups["name"].Value;
-            tvfNames.Add(name);
+            if (IsSelfInvocation(definition, name)) continue;
 
+            tvfNames.Add(name);
             var callee = new SqlObject(name, SqlObjectType.UserFunction);
             edges.Add(new InvocationEdge(definition, callee));
         }
 
-        // 3) Scalar‐func calls → UserFunction, skipping self‐invocation and any TVF
+        // 3) Scalar‐func calls → UserFunction, skip self and any TVF
         foreach (Match m in ScalarFuncRegex.Matches(clean))
         {
             var calleeName = m.Groups["name"].Value;
-
-            if (IsSelfInvocation(definition, calleeName) ||
-                tvfNames.Contains(calleeName))
-            {
+            if (IsSelfInvocation(definition, calleeName) || tvfNames.Contains(calleeName))
                 continue;
-            }
 
             var callee = new SqlObject(calleeName, SqlObjectType.UserFunction);
             edges.Add(new InvocationEdge(definition, callee));
         }
 
-        return new ParsedFile(definition, edges);
+        // 4) Dedupe edges (caller|type|callee)
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var unique = new List<InvocationEdge>();
+        foreach (var e in edges)
+        {
+            var key = $"{e.Caller.Name}|{e.Callee.Type}|{e.Callee.Name}";
+            if (seen.Add(key)) unique.Add(e);
+        }
+
+        return new ParsedFile(definition, unique);
     }
 
     private static bool IsSelfInvocation(SqlObject definition, string candidateName)
@@ -114,5 +127,11 @@ public static class TsqlParser
         var noLines = LineCommentRegex.Replace(noBlocks, "");
         var noLiterals = StringRegex.Replace(noLines, "");
         return noLiterals;
+    }
+
+    private static string StripTypeParameterLists(string sql)
+    {
+        return DataTypeWithParensRegex.Replace(sql, m =>
+            Regex.Replace(m.Value, @"\s*\([^)]*\)", ""));
     }
 }

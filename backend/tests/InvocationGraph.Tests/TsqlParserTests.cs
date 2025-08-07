@@ -228,4 +228,130 @@ public class TsqlParserTests
         Assert.NotNull(result);
         Assert.Empty(result.Edges);
     }
+
+    [Fact]
+    public void Parse_WhenVariableDeclaredWithParameterizedType_ShouldNotTreatTypeAsFunction()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.Proc
+        AS
+        BEGIN
+            DECLARE @n DECIMAL(10,2) = 0;
+            DECLARE @s NVARCHAR(50);
+            SELECT 1;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.Proc", result.Definition.Name);
+        Assert.Equal(SqlObjectType.StoredProcedure, result.Definition.Type);
+        Assert.Empty(result.Edges);
+    }
+
+    [Fact]
+    public void Parse_WhenProcHasParamsWithParameterizedTypes_ShouldNotTreatTypesAsFunctions()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.Proc
+            @Id INT,
+            @Name NVARCHAR(50),
+            @Amount DECIMAL(10,2)
+        AS
+        BEGIN
+            SELECT 1;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.Proc", result.Definition.Name);
+        Assert.Equal(SqlObjectType.StoredProcedure, result.Definition.Type);
+        Assert.Empty(result.Edges);
+    }
+
+    [Fact]
+    public void Parse_ComplexScript_AllSignalsCaptured_NoiseIgnored_SelfSkipped()
+    {
+        var text = @"
+        CREATE PROCEDURE [dbo].[Proc_Complex]
+            @Id INT,
+            @Name NVARCHAR(50),
+            @Amount DECIMAL(10,2)
+        AS
+        BEGIN
+            -- Noise in comments: EXEC dbo.ShouldNotAppear; dbo.NopeFunc(1); NVARCHAR(77)
+            /* Also: DECIMAL(9,9) and EXEC [dbo].[NopeInBlock] */
+
+            DECLARE @str NVARCHAR(100);
+            DECLARE @m DECIMAL(18,6);
+
+            -- Real scalar function call
+            SET @Id = [dbo].[udf_Scalar](@Id);
+
+            -- TVF in FROM
+            SELECT *
+            FROM [dbo].[tvf_GetStuff](@Id) AS g;
+
+            -- Stored proc calls
+            EXEC [dbo].[RunThis];
+            EXECUTE dbo.AnotherProc;
+
+            -- Self invocation (must be ignored)
+            EXEC [dbo].[Proc_Complex];
+
+            -- Noise in strings
+            SELECT 'EXEC dbo.FakeProc; dbo.FakeFunc(1)';
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        // Definition checks
+        Assert.NotNull(result);
+        Assert.Equal("[dbo].[Proc_Complex]", result!.Definition.Name);
+        Assert.Equal(SqlObjectType.StoredProcedure, result.Definition.Type);
+
+        // Expect exactly these four edges:
+        // - Stored procs: [dbo].[RunThis], dbo.AnotherProc
+        // - Functions:    [dbo].[tvf_GetStuff] (TVF), [dbo].[udf_Scalar] (scalar)
+        Assert.Equal(4, result.Edges.Count);
+
+        // Every edge must originate from the same caller (the definition)
+        Assert.All(result.Edges, e =>
+        {
+            Assert.Equal(result.Definition.Name, e.Caller.Name);
+            Assert.Equal(result.Definition.Type, e.Caller.Type);
+        });
+
+        // Stored procedure edges (EXEC / EXECUTE)
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "[dbo].[RunThis]" &&
+            e.Callee.Type == SqlObjectType.StoredProcedure);
+
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "dbo.AnotherProc" &&
+            e.Callee.Type == SqlObjectType.StoredProcedure);
+
+        // Function edges (TVF + scalar)
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "[dbo].[tvf_GetStuff]" &&
+            e.Callee.Type == SqlObjectType.UserFunction);
+
+        Assert.Contains(result.Edges, e =>
+            e.Callee.Name == "[dbo].[udf_Scalar]" &&
+            e.Callee.Type == SqlObjectType.UserFunction);
+
+        // No self edge
+        Assert.DoesNotContain(result.Edges, e =>
+            string.Equals(e.Callee.Name, result.Definition.Name, StringComparison.OrdinalIgnoreCase));
+
+        // Guardrails: parameterized types and noise should NOT appear as edges
+        Assert.DoesNotContain(result.Edges, e =>
+            e.Callee.Name.Equals("DECIMAL", StringComparison.OrdinalIgnoreCase) ||
+            e.Callee.Name.Equals("NVARCHAR", StringComparison.OrdinalIgnoreCase) ||
+            e.Callee.Name.Equals("dbo.FakeProc", StringComparison.OrdinalIgnoreCase) ||
+            e.Callee.Name.Equals("dbo.FakeFunc", StringComparison.OrdinalIgnoreCase) ||
+            e.Callee.Name.Equals("[dbo].[NopeInBlock]", StringComparison.OrdinalIgnoreCase));
+    }
+
 }
