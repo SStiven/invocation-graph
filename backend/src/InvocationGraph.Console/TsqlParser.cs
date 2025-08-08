@@ -25,14 +25,14 @@ public static class TsqlParser
         $@"(?<!\bFROM\s+)(?<![A-Za-z0-9_\]\.""])(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)\s*\(",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private static readonly Regex BlockCommentRegex = new(@"/\*.*?\*/",
-        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex BlockCommentRegex = new(
+        @"/\*.*?\*/", RegexOptions.Singleline | RegexOptions.Compiled);
 
-    private static readonly Regex LineCommentRegex = new(@"--.*?$",
-        RegexOptions.Multiline | RegexOptions.Compiled);
+    private static readonly Regex LineCommentRegex = new(
+        @"--.*?$", RegexOptions.Multiline | RegexOptions.Compiled);
 
-    private static readonly Regex StringRegex = new(@"'([^']|'')*'",
-        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex StringRegex = new(
+        @"'([^']|'')*'", RegexOptions.Singleline | RegexOptions.Compiled);
 
     private static readonly Regex DataTypeWithParensRegex = new(
         @"\b(?:NVARCHAR|VARCHAR|NCHAR|CHAR|VARBINARY|BINARY|DECIMAL|NUMERIC|FLOAT|REAL|TIME|DATETIME2|DATETIMEOFFSET)\s*\([^)]*\)",
@@ -70,45 +70,45 @@ public static class TsqlParser
         @"(\bWHEN\s+(?:NOT\s+)?MATCHED(?:\s+BY\s+(?:TARGET|SOURCE))?\s+THEN\s+INSERT)\s*\([^)]*\)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    private static string StripMergeInsertColumnLists(string sql) =>
-    MergeInsertColumnListRegex.Replace(sql, "$1");
-
     public static ParsedFile? Parse(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
 
-        var clean = StripCommentsAndStrings(text);
-        clean = StripTypeParameterLists(clean);
-        clean = StripInsertColumnLists(clean);
-        clean = StripInsertColumnLists(clean);
-        clean = StripMergeInsertColumnLists(clean);
+        var clean = RemoveCommentsAndStringLiterals(text);
+        clean = RemoveParameterizedTypeDeclarations(clean);
+        clean = RemoveInsertIntoColumnLists(clean);
+        clean = RemoveMergeInsertColumnLists(clean);
 
         var defMatch = CreateRegex.Match(clean);
         if (!defMatch.Success) return null;
 
-        var defType = ParseType(defMatch.Groups[1].Value);
-        var defName = defMatch.Groups["name"].Value;
-        var definition = new SqlObject(defName, defType);
+        var definition = ExtractDefinitionFromMatch(defMatch);
 
         var edges = new List<InvocationEdge>();
         var tvfNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var mergeUsingSpans = LocateMergeUsingSubqueryBoundaries(clean);
 
-        var mergeUsingSpans = FindUsingSubqueryRanges(clean);
+        edges.AddRange(GetStoredProcedureCalls(clean, definition));
+        edges.AddRange(GetTableValuedFunctionCalls(clean, definition, tvfNames));
+        edges.AddRange(GetTableReferencesFromFromJoinClausesExcludingMergeSubqueries(clean, definition, tvfNames, mergeUsingSpans));
+        edges.AddRange(GetInsertTargetTables(clean, definition));
+        edges.AddRange(GetUpdateTargetTables(clean, definition));
+        edges.AddRange(GetDeleteTargetTables(clean, definition));
+        edges.AddRange(GetScalarFunctionCalls(clean, definition, tvfNames));
+        edges.AddRange(GetMergeTargetTables(clean, definition));
+        edges.AddRange(GetMergeSourceTablesAndSubqueryTables(clean, definition, tvfNames));
 
-        edges.AddRange(GetExecEdges(clean, definition));
-        edges.AddRange(GetTvfEdges(clean, definition, tvfNames));
-        edges.AddRange(GetFromJoinTableEdges(clean, definition, tvfNames, mergeUsingSpans)); // changed
-        edges.AddRange(GetInsertIntoEdges(clean, definition));
-        edges.AddRange(GetUpdateTargetEdges(clean, definition));
-        edges.AddRange(GetDeleteFromEdges(clean, definition));
-        edges.AddRange(GetScalarFunctionEdges(clean, definition, tvfNames));
-        edges.AddRange(GetMergeTargetEdges(clean, definition));
-        edges.AddRange(GetMergeUsingEdges(clean, definition, tvfNames));
-
-        return new ParsedFile(definition, DedupeEdges(edges));
+        return new ParsedFile(definition, RemoveDuplicateEdges(edges));
     }
 
-    private static IEnumerable<InvocationEdge> GetExecEdges(string sql, SqlObject definition)
+    private static SqlObject ExtractDefinitionFromMatch(Match defMatch)
+    {
+        var defType = ParseType(defMatch.Groups[1].Value);
+        var defName = defMatch.Groups["name"].Value;
+        return new SqlObject(defName, defType);
+    }
+
+    private static IEnumerable<InvocationEdge> GetStoredProcedureCalls(string sql, SqlObject definition)
     {
         foreach (Match m in ExecRegex.Matches(sql))
         {
@@ -118,7 +118,7 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetTvfEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
+    private static IEnumerable<InvocationEdge> GetTableValuedFunctionCalls(string sql, SqlObject definition, HashSet<string> tvfNames)
     {
         foreach (Match m in TableValuedFuncRegex.Matches(sql))
         {
@@ -129,7 +129,7 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetFromJoinTableEdges(
+    private static IEnumerable<InvocationEdge> GetTableReferencesFromFromJoinClausesExcludingMergeSubqueries(
         string sql,
         SqlObject definition,
         HashSet<string> tvfNames,
@@ -137,7 +137,7 @@ public static class TsqlParser
     {
         foreach (Match m in FromJoinObjectRegex.Matches(sql))
         {
-            if (IsInsideAny(m.Index, mergeUsingSpans)) continue;
+            if (IsIndexWithinAnySpan(m.Index, mergeUsingSpans)) continue;
 
             var name = m.Groups["name"].Value;
             if (IsSelfInvocation(definition, name)) continue;
@@ -147,7 +147,7 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetInsertIntoEdges(string sql, SqlObject definition)
+    private static IEnumerable<InvocationEdge> GetInsertTargetTables(string sql, SqlObject definition)
     {
         foreach (Match m in InsertIntoRegex.Matches(sql))
         {
@@ -157,7 +157,7 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetUpdateTargetEdges(string sql, SqlObject definition)
+    private static IEnumerable<InvocationEdge> GetUpdateTargetTables(string sql, SqlObject definition)
     {
         foreach (Match m in UpdateTargetQualifiedRegex.Matches(sql))
         {
@@ -167,7 +167,7 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetDeleteFromEdges(string sql, SqlObject definition)
+    private static IEnumerable<InvocationEdge> GetDeleteTargetTables(string sql, SqlObject definition)
     {
         foreach (Match m in DeleteFromRegex.Matches(sql))
         {
@@ -177,7 +177,7 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetScalarFunctionEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
+    private static IEnumerable<InvocationEdge> GetScalarFunctionCalls(string sql, SqlObject definition, HashSet<string> tvfNames)
     {
         foreach (Match m in ScalarFuncRegex.Matches(sql))
         {
@@ -190,7 +190,40 @@ public static class TsqlParser
         }
     }
 
-    private static List<InvocationEdge> DedupeEdges(IEnumerable<InvocationEdge> edges)
+    private static IEnumerable<InvocationEdge> GetMergeTargetTables(string sql, SqlObject definition)
+    {
+        foreach (Match m in MergeTargetRegex.Matches(sql))
+        {
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
+        }
+    }
+
+    private static IEnumerable<InvocationEdge> GetMergeSourceTablesAndSubqueryTables(string sql, SqlObject definition, HashSet<string> tvfNames)
+    {
+        foreach (Match m in MergeUsingRegex.Matches(sql))
+        {
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+            if (tvfNames.Contains(name)) continue;
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
+        }
+
+        foreach (Match m in Regex.Matches(sql, @"\bUSING\s*\((?<subquery>.*?)\)\s+AS", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+        {
+            var subquery = m.Groups["subquery"].Value;
+            foreach (Match fm in FromJoinObjectRegex.Matches(subquery))
+            {
+                var subName = fm.Groups["name"].Value;
+                if (IsSelfInvocation(definition, subName)) continue;
+                if (tvfNames.Contains(subName)) continue;
+                yield return new InvocationEdge(definition, new SqlObject(subName, SqlObjectType.Table));
+            }
+        }
+    }
+
+    private static List<InvocationEdge> RemoveDuplicateEdges(IEnumerable<InvocationEdge> edges)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var unique = new List<InvocationEdge>();
@@ -200,9 +233,7 @@ public static class TsqlParser
             var callerKey = CanonicalizeName(e.Caller.Name);
             var calleeKey = CanonicalizeName(e.Callee.Name);
             var key = $"{callerKey}|{e.Callee.Type}|{calleeKey}";
-
-            if (seen.Add(key))
-                unique.Add(e);
+            if (seen.Add(key)) unique.Add(e);
         }
 
         return unique;
@@ -225,18 +256,21 @@ public static class TsqlParser
             _ => throw new ArgumentException($"Unknown SQL object type '{token}'.", nameof(token))
         };
 
-    private static string StripCommentsAndStrings(string sql)
+    private static string RemoveCommentsAndStringLiterals(string sql)
     {
         var noBlocks = BlockCommentRegex.Replace(sql, "");
         var noLines = LineCommentRegex.Replace(noBlocks, "");
         return StringRegex.Replace(noLines, "");
     }
 
-    private static string StripTypeParameterLists(string sql) =>
+    private static string RemoveParameterizedTypeDeclarations(string sql) =>
         DataTypeWithParensRegex.Replace(sql, m => Regex.Replace(m.Value, @"\s*\([^)]*\)", ""));
 
-    private static string StripInsertColumnLists(string sql) =>
+    private static string RemoveInsertIntoColumnLists(string sql) =>
         InsertColumnListRegex.Replace(sql, "$1");
+
+    private static string RemoveMergeInsertColumnLists(string sql) =>
+        MergeInsertColumnListRegex.Replace(sql, "$1");
 
     private static string CanonicalizeName(string name)
     {
@@ -261,40 +295,7 @@ public static class TsqlParser
         return string.Join(".", parts);
     }
 
-    private static IEnumerable<InvocationEdge> GetMergeTargetEdges(string sql, SqlObject definition)
-    {
-        foreach (Match m in MergeTargetRegex.Matches(sql))
-        {
-            var name = m.Groups["name"].Value;
-            if (IsSelfInvocation(definition, name)) continue;
-            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
-        }
-    }
-
-    private static IEnumerable<InvocationEdge> GetMergeUsingEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
-    {
-        foreach (Match m in MergeUsingRegex.Matches(sql))
-        {
-            var name = m.Groups["name"].Value;
-            if (IsSelfInvocation(definition, name)) continue;
-            if (tvfNames.Contains(name)) continue;
-            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
-        }
-
-        foreach (Match m in Regex.Matches(sql, @"\bUSING\s*\((?<subquery>.*?)\)\s+AS", RegexOptions.IgnoreCase | RegexOptions.Singleline))
-        {
-            var subquery = m.Groups["subquery"].Value;
-            foreach (Match fm in FromJoinObjectRegex.Matches(subquery))
-            {
-                var subName = fm.Groups["name"].Value;
-                if (IsSelfInvocation(definition, subName)) continue;
-                if (tvfNames.Contains(subName)) continue;
-                yield return new InvocationEdge(definition, new SqlObject(subName, SqlObjectType.Table));
-            }
-        }
-    }
-
-    private static List<(int start, int end)> FindUsingSubqueryRanges(string sql)
+    private static List<(int start, int end)> LocateMergeUsingSubqueryBoundaries(string sql)
     {
         var spans = new List<(int start, int end)>();
         var usingOpenRx = new Regex(@"\bUSING\s*\(", RegexOptions.IgnoreCase);
@@ -323,6 +324,6 @@ public static class TsqlParser
         return spans;
     }
 
-    private static bool IsInsideAny(int index, List<(int start, int end)> spans)
-        => spans.Any(s => index >= s.start && index <= s.end);
+    private static bool IsIndexWithinAnySpan(int index, List<(int start, int end)> spans) =>
+        spans.Any(s => index >= s.start && index <= s.end);
 }
