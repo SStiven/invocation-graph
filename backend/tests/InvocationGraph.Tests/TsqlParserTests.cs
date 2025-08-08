@@ -694,4 +694,182 @@ public class TsqlParserTests
         Assert.Single(result.Edges);
     }
 
+    [Fact]
+    public void Parse_WithUnion_TopLevelSelect_ShouldCaptureBothTables()
+    {
+        var text = @"
+                CREATE VIEW dbo.V1
+                AS
+                SELECT c1 FROM dbo.TableA
+                UNION
+                SELECT c1 FROM dbo.TableB;
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.V1", result.Definition.Name);
+        Assert.Equal(SqlObjectType.View, result.Definition.Type);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.TableA" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.TableB" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(2, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_WithUnionAll_TvfInFrom_ShouldCaptureBothFunctionsAsUserFunction()
+    {
+        var text = @"
+                CREATE VIEW dbo.V2
+                AS
+                SELECT * FROM dbo.Foo()
+                UNION ALL
+                SELECT * FROM [dbo].[Bar]();
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Equal("dbo.V2", result.Definition.Name);
+        Assert.Equal(SqlObjectType.View, result.Definition.Type);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Foo" && e.Callee.Type == SqlObjectType.UserFunction);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "[dbo].[Bar]" && e.Callee.Type == SqlObjectType.UserFunction);
+        Assert.Equal(2, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_WithUnion_SubqueryInFrom_ShouldCaptureInnerTables()
+    {
+        var text = @"
+                CREATE VIEW dbo.V3
+                AS
+                SELECT u.*
+                FROM (
+                    SELECT * FROM dbo.Users
+                    UNION
+                    SELECT * FROM [dbo].[ArchivedUsers]
+                ) u
+                JOIN dbo.Roles r ON r.Id = u.RoleId;
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        var names = result.Edges.Select(e => e.Callee.Name).ToHashSet();
+        Assert.Contains("dbo.Users", names);
+        Assert.Contains("[dbo].[ArchivedUsers]", names);
+        Assert.Contains("dbo.Roles", names);
+        Assert.Equal(3, names.Count);
+    }
+
+    [Fact]
+    public void Parse_InsertInto_WithUnionSelect_ShouldCaptureTargetAndSources()
+    {
+        var text = @"
+                CREATE PROCEDURE dbo.Populate
+                AS
+                BEGIN
+                    INSERT INTO dbo.Target (Id, Name)
+                    SELECT Id, Name FROM dbo.Source1
+                    UNION
+                    SELECT Id, Name FROM dbo.Source2;
+                END
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Target" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Source1" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Source2" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(3, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_Union_OneBranchWithoutFrom_ShouldCaptureOnlyExistingFromTables()
+    {
+        var text = @"
+                CREATE VIEW dbo.V4
+                AS
+                SELECT 1 AS A
+                UNION ALL
+                SELECT A FROM dbo.HasFrom;
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Single(result.Edges);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.HasFrom" && e.Callee.Type == SqlObjectType.Table);
+    }
+
+    [Fact]
+    public void Parse_Merge_UsingSubqueryWithUnion_ShouldCaptureTargetAndUnionSources_NoDupes()
+    {
+        var text = @"
+                CREATE PROCEDURE dbo.MergeProc
+                AS
+                BEGIN
+                    MERGE dbo.Target AS t
+                    USING (
+                        SELECT * FROM dbo.S1
+                        UNION
+                        SELECT * FROM dbo.S2
+                    ) AS s
+                    ON t.Id = s.Id
+                    WHEN MATCHED THEN UPDATE SET t.Col = s.Col;
+                END
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Target" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.S1" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.S2" && e.Callee.Type == SqlObjectType.Table);
+
+        var keys = result.Edges
+            .Select(e => (e.Callee.Name.ToLowerInvariant(), e.Callee.Type))
+            .ToList();
+        Assert.Equal(keys.Count, keys.Distinct().Count());
+    }
+
+    [Fact]
+    public void Parse_Union_DuplicateSameTableBothBranches_ShouldDeduplicate()
+    {
+        var text = @"
+                CREATE VIEW dbo.V5
+                AS
+                SELECT * FROM dbo.Dup
+                UNION
+                SELECT * FROM dbo.Dup;
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Single(result.Edges);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Dup" && e.Callee.Type == SqlObjectType.Table);
+    }
+
+    [Fact]
+    public void Parse_CteWithUnion_ShouldCaptureBothSources()
+    {
+        var text = @"
+                CREATE VIEW dbo.V6
+                AS
+                WITH C AS (
+                    SELECT * FROM dbo.A
+                    UNION ALL
+                    SELECT * FROM dbo.B
+                )
+                SELECT * FROM C;
+            ";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.A" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.B" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(2, result.Edges.Count);
+    }
 }

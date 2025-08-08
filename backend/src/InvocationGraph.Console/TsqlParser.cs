@@ -1,5 +1,6 @@
 ﻿using InvocationGraph.UI;
 using System.Text.RegularExpressions;
+using System.Linq;
 
 public static class TsqlParser
 {
@@ -7,7 +8,7 @@ public static class TsqlParser
         @"(?:\[[^\]]+\]|""[^""]+""|[A-Za-z_][\w]*)";
 
     private static readonly HashSet<string> IgnoredScalarNames =
-        new(StringComparer.OrdinalIgnoreCase) { "VALUES", "USING", "INSERT" };
+        new(StringComparer.OrdinalIgnoreCase) { "VALUES", "USING", "INSERT", "AS", "OVER", "FROM" };
 
     private static readonly Regex CreateRegex = new(
         $@"\bCREATE\s+(PROCEDURE|TABLE|VIEW|FUNCTION|TRIGGER)\s+(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)",
@@ -22,7 +23,7 @@ public static class TsqlParser
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex ScalarFuncRegex = new(
-        $@"(?<!\bFROM\s+)(?<![A-Za-z0-9_\]\.""])(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)\s*\(",
+        $@"(?<!\bFROM\s+)(?<![A-Za-z0-9_\]\.""])(?!\b(?:FROM|AS|OVER|USING|INSERT|SELECT|WHERE|UNION|JOIN|ON|GROUP|ORDER)\b)(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)\s*\(",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex BlockCommentRegex = new(
@@ -40,6 +41,14 @@ public static class TsqlParser
 
     private static readonly Regex FromJoinObjectRegex = new(
         $@"\b(?:FROM|JOIN)\s+(?<name>(?>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*))\s*(?!\s*\()",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex FromJoinAliasRegex = new(
+        $@"\b(?:FROM|JOIN)\s+(?:{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)\s+(?:AS\s+)?(?<alias>{IdentifierPattern})\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex SelectQualifierRegex = new(
+        $@"\bSELECT\b[\s\S]*?\b(?<q>{IdentifierPattern})\s*\.",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex InsertIntoRegex = new(
@@ -74,25 +83,53 @@ public static class TsqlParser
         @"\bUSING\s*\((?<subquery>.*?)\)\s*(?:AS\s+)?(?<alias>\w+)?",
         RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
 
+    private static readonly Regex WithCteHeadRegex = new(
+        $@"\bWITH\s+(?<name>{IdentifierPattern})\s+AS\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex WithCteTailRegex = new(
+        $@",\s*(?<name>{IdentifierPattern})\s+AS\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex FromJoinDerivedOpenRegex = new(
+        @"\b(?:FROM|JOIN)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public static ParsedFile? Parse(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
         var clean = Preprocess(text);
+        var cteNames = GetCteNames(clean);
+        var derivedAliases = GetDerivedTableAliases(clean);
+        var fromJoinAliases = GetFromJoinAliases(clean);
+        var selectQualifiers = GetSelectQualifiers(clean);
+
+        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var n in cteNames) excluded.Add(CanonicalizeName(n));
+        foreach (var n in derivedAliases) excluded.Add(CanonicalizeName(n));
+        foreach (var n in fromJoinAliases) excluded.Add(CanonicalizeName(n));
+        foreach (var n in selectQualifiers) excluded.Add(CanonicalizeName(n));
+
         var defMatch = CreateRegex.Match(clean);
         if (!defMatch.Success) return null;
+
         var definition = ExtractDefinitionFromMatch(defMatch);
         var edges = new List<InvocationEdge>();
         var tvfNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var mergeUsingSpans = LocateMergeUsingSubqueryBoundaries(clean);
+
         edges.AddRange(GetStoredProcedureCalls(clean, definition));
         edges.AddRange(GetTableValuedFunctionCalls(clean, definition, tvfNames));
-        edges.AddRange(GetTableReferencesFromFromJoinClausesExcludingMergeSubqueries(clean, definition, tvfNames, mergeUsingSpans));
+        edges.AddRange(GetTableReferencesFromFromJoinClausesExcludingMergeSubqueries(clean, definition, tvfNames, mergeUsingSpans, excluded));
         edges.AddRange(GetInsertTargetTables(clean, definition));
         edges.AddRange(GetUpdateTargetTables(clean, definition));
         edges.AddRange(GetDeleteTargetTables(clean, definition));
         edges.AddRange(GetScalarFunctionCalls(clean, definition, tvfNames));
         edges.AddRange(GetMergeTargetTables(clean, definition));
-        edges.AddRange(GetMergeSourceTablesAndSubqueryTables(clean, definition, tvfNames));
+        edges.AddRange(GetMergeSourceTablesAndSubqueryTables(clean, definition, tvfNames, excluded));
+
+        edges = edges.Where(e => !excluded.Contains(CanonicalizeName(e.Callee.Name))).ToList();
+
         return new ParsedFile(definition, RemoveDuplicateEdges(edges));
     }
 
@@ -134,12 +171,13 @@ public static class TsqlParser
     }
 
     private static IEnumerable<InvocationEdge> GetTableReferencesFromFromJoinClausesExcludingMergeSubqueries(
-        string sql, SqlObject definition, HashSet<string> tvfNames, List<(int start, int end)> mergeUsingSpans)
+        string sql, SqlObject definition, HashSet<string> tvfNames, List<(int start, int end)> mergeUsingSpans, HashSet<string> excludedCanonicalNames)
     {
         foreach (Match m in FromJoinObjectRegex.Matches(sql))
         {
             if (IsIndexWithinAnySpan(m.Index, mergeUsingSpans)) continue;
             var name = m.Groups["name"].Value;
+            if (excludedCanonicalNames.Contains(CanonicalizeName(name))) continue;
             if (!ShouldAddTableEdge(definition, name, tvfNames)) continue;
             yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
         }
@@ -198,11 +236,12 @@ public static class TsqlParser
     }
 
     private static IEnumerable<InvocationEdge> GetMergeSourceTablesAndSubqueryTables(
-        string sql, SqlObject definition, HashSet<string> tvfNames)
+        string sql, SqlObject definition, HashSet<string> tvfNames, HashSet<string> excludedCanonicalNames)
     {
         foreach (Match m in MergeUsingRegex.Matches(sql))
         {
             var name = m.Groups["name"].Value;
+            if (excludedCanonicalNames.Contains(CanonicalizeName(name))) continue;
             if (ShouldAddTableEdge(definition, name, tvfNames))
                 yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
         }
@@ -212,6 +251,7 @@ public static class TsqlParser
             foreach (Match fm in FromJoinObjectRegex.Matches(subquery))
             {
                 var subName = fm.Groups["name"].Value;
+                if (excludedCanonicalNames.Contains(CanonicalizeName(subName))) continue;
                 if (ShouldAddTableEdge(definition, subName, tvfNames))
                     yield return new InvocationEdge(definition, new SqlObject(subName, SqlObjectType.Table));
             }
@@ -321,4 +361,75 @@ public static class TsqlParser
 
     private static bool IsIndexWithinAnySpan(int index, List<(int start, int end)> spans) =>
         spans.Any(s => index >= s.start && index <= s.end);
+
+    private static HashSet<string> GetCteNames(string text)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in WithCteHeadRegex.Matches(text))
+            names.Add(m.Groups["name"].Value);
+        foreach (Match m in WithCteTailRegex.Matches(text))
+            names.Add(m.Groups["name"].Value);
+        return names;
+    }
+
+    private static int FindMatchingParen(string s, int openIndex)
+    {
+        int depth = 0;
+        for (int i = openIndex; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '(') depth++;
+            else if (c == ')')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    private static HashSet<string> GetDerivedTableAliases(string text)
+    {
+        var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in FromJoinDerivedOpenRegex.Matches(text))
+        {
+            int open = text.IndexOf('(', m.Index);
+            if (open < 0) continue;
+            int close = FindMatchingParen(text, open);
+            if (close < 0) continue;
+            var tail = text.AsSpan(close + 1);
+            var aliasMatch = Regex.Match(tail.ToString(),
+                $@"^\s*(?:AS\s+)?(?<alias>{IdentifierPattern})\b",
+                RegexOptions.IgnoreCase);
+            if (aliasMatch.Success)
+            {
+                var alias = aliasMatch.Groups["alias"].Value;
+                if (!string.IsNullOrWhiteSpace(alias))
+                    aliases.Add(alias);
+            }
+        }
+        return aliases;
+    }
+
+    private static HashSet<string> GetFromJoinAliases(string text)
+    {
+        var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in FromJoinAliasRegex.Matches(text))
+        {
+            var a = m.Groups["alias"].Value;
+            if (!string.IsNullOrWhiteSpace(a)) aliases.Add(a);
+        }
+        return aliases;
+    }
+
+    private static HashSet<string> GetSelectQualifiers(string text)
+    {
+        var qs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in SelectQualifierRegex.Matches(text))
+        {
+            var q = m.Groups["q"].Value;
+            if (!string.IsNullOrWhiteSpace(q)) qs.Add(q);
+        }
+        return qs;
+    }
 }
