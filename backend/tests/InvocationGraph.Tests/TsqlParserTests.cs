@@ -588,4 +588,110 @@ public class TsqlParserTests
         var edge = Assert.Single(result.Edges);
         Assert.Equal(SqlObjectType.UserFunction, edge.Callee.Type);
     }
+
+    [Fact]
+    public void Parse_WhenMergeWithSimpleTargetAndSource_ShouldCaptureBothEdges()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            MERGE dbo.Target AS t
+            USING dbo.Source AS s
+            ON t.Id = s.Id
+            WHEN MATCHED THEN UPDATE SET t.Col = s.Col;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Target" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Source" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(2, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_WhenMergeWithoutAliases_ShouldCaptureBothEdges()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            MERGE [dbo].[Target]
+            USING [dbo].[Source]
+            ON Target.Id = Source.Id
+            WHEN MATCHED THEN UPDATE SET Target.Col = Source.Col;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "[dbo].[Target]" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "[dbo].[Source]" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(2, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_WhenMergeWithQuotedIdentifiers_ShouldCaptureBothEdges()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            MERGE ""dbo"".""Target"" AS t
+            USING [dbo].[Source] AS s
+            ON t.Id = s.Id
+            WHEN MATCHED THEN UPDATE SET t.Col = s.Col;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "\"dbo\".\"Target\"" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "[dbo].[Source]" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(2, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_WhenMergeWithSubquerySource_ShouldCaptureTargetAndRealSource()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.P
+        AS
+        BEGIN
+            MERGE dbo.Target AS t
+            USING (SELECT * FROM dbo.RealSource) AS s
+            ON t.Id = s.Id
+            WHEN NOT MATCHED THEN INSERT (Col) VALUES (s.Col);
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Target" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.RealSource" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Equal(2, result.Edges.Count);
+    }
+
+    [Fact]
+    public void Parse_WhenMergeSelfTarget_ShouldSkipTargetEdge()
+    {
+        var text = @"
+        CREATE PROCEDURE dbo.Target
+        AS
+        BEGIN
+            MERGE dbo.Target AS t
+            USING dbo.Source AS s
+            ON t.Id = s.Id
+            WHEN MATCHED THEN UPDATE SET t.Col = s.Col;
+        END";
+
+        var result = TsqlParser.Parse(text);
+
+        Assert.NotNull(result);
+        Assert.DoesNotContain(result.Edges, e => e.Callee.Name == "dbo.Target");
+        Assert.Contains(result.Edges, e => e.Callee.Name == "dbo.Source" && e.Callee.Type == SqlObjectType.Table);
+        Assert.Single(result.Edges);
+    }
+
 }

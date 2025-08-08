@@ -7,7 +7,7 @@ public static class TsqlParser
         @"(?:\[[^\]]+\]|""[^""]+""|[A-Za-z_][\w]*)";
 
     private static readonly HashSet<string> IgnoredScalarNames =
-        new(StringComparer.OrdinalIgnoreCase) { "VALUES" };
+        new(StringComparer.OrdinalIgnoreCase) { "VALUES", "USING", "INSERT" };
 
     private static readonly Regex CreateRegex = new(
         $@"\bCREATE\s+(PROCEDURE|TABLE|VIEW|FUNCTION|TRIGGER)\s+(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)",
@@ -58,6 +58,21 @@ public static class TsqlParser
         $@"(\bINSERT\s+INTO\s+{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)\s*\([^)]*\)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex MergeTargetRegex = new(
+        $@"\bMERGE\s+(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex MergeUsingRegex = new(
+        $@"\bUSING\s+(?<name>{IdentifierPattern}(?:\s*\.\s*{IdentifierPattern})*)(?!\s*\()",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex MergeInsertColumnListRegex = new(
+        @"(\bWHEN\s+(?:NOT\s+)?MATCHED(?:\s+BY\s+(?:TARGET|SOURCE))?\s+THEN\s+INSERT)\s*\([^)]*\)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static string StripMergeInsertColumnLists(string sql) =>
+    MergeInsertColumnListRegex.Replace(sql, "$1");
+
     public static ParsedFile? Parse(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
@@ -65,6 +80,8 @@ public static class TsqlParser
         var clean = StripCommentsAndStrings(text);
         clean = StripTypeParameterLists(clean);
         clean = StripInsertColumnLists(clean);
+        clean = StripInsertColumnLists(clean);
+        clean = StripMergeInsertColumnLists(clean);
 
         var defMatch = CreateRegex.Match(clean);
         if (!defMatch.Success) return null;
@@ -76,13 +93,17 @@ public static class TsqlParser
         var edges = new List<InvocationEdge>();
         var tvfNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        var mergeUsingSpans = FindUsingSubqueryRanges(clean);
+
         edges.AddRange(GetExecEdges(clean, definition));
         edges.AddRange(GetTvfEdges(clean, definition, tvfNames));
-        edges.AddRange(GetFromJoinTableEdges(clean, definition, tvfNames));
+        edges.AddRange(GetFromJoinTableEdges(clean, definition, tvfNames, mergeUsingSpans)); // changed
         edges.AddRange(GetInsertIntoEdges(clean, definition));
         edges.AddRange(GetUpdateTargetEdges(clean, definition));
         edges.AddRange(GetDeleteFromEdges(clean, definition));
         edges.AddRange(GetScalarFunctionEdges(clean, definition, tvfNames));
+        edges.AddRange(GetMergeTargetEdges(clean, definition));
+        edges.AddRange(GetMergeUsingEdges(clean, definition, tvfNames));
 
         return new ParsedFile(definition, DedupeEdges(edges));
     }
@@ -108,13 +129,20 @@ public static class TsqlParser
         }
     }
 
-    private static IEnumerable<InvocationEdge> GetFromJoinTableEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
+    private static IEnumerable<InvocationEdge> GetFromJoinTableEdges(
+        string sql,
+        SqlObject definition,
+        HashSet<string> tvfNames,
+        List<(int start, int end)> mergeUsingSpans)
     {
         foreach (Match m in FromJoinObjectRegex.Matches(sql))
         {
+            if (IsInsideAny(m.Index, mergeUsingSpans)) continue;
+
             var name = m.Groups["name"].Value;
             if (IsSelfInvocation(definition, name)) continue;
             if (tvfNames.Contains(name)) continue;
+
             yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
         }
     }
@@ -232,4 +260,69 @@ public static class TsqlParser
 
         return string.Join(".", parts);
     }
+
+    private static IEnumerable<InvocationEdge> GetMergeTargetEdges(string sql, SqlObject definition)
+    {
+        foreach (Match m in MergeTargetRegex.Matches(sql))
+        {
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
+        }
+    }
+
+    private static IEnumerable<InvocationEdge> GetMergeUsingEdges(string sql, SqlObject definition, HashSet<string> tvfNames)
+    {
+        foreach (Match m in MergeUsingRegex.Matches(sql))
+        {
+            var name = m.Groups["name"].Value;
+            if (IsSelfInvocation(definition, name)) continue;
+            if (tvfNames.Contains(name)) continue;
+            yield return new InvocationEdge(definition, new SqlObject(name, SqlObjectType.Table));
+        }
+
+        foreach (Match m in Regex.Matches(sql, @"\bUSING\s*\((?<subquery>.*?)\)\s+AS", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+        {
+            var subquery = m.Groups["subquery"].Value;
+            foreach (Match fm in FromJoinObjectRegex.Matches(subquery))
+            {
+                var subName = fm.Groups["name"].Value;
+                if (IsSelfInvocation(definition, subName)) continue;
+                if (tvfNames.Contains(subName)) continue;
+                yield return new InvocationEdge(definition, new SqlObject(subName, SqlObjectType.Table));
+            }
+        }
+    }
+
+    private static List<(int start, int end)> FindUsingSubqueryRanges(string sql)
+    {
+        var spans = new List<(int start, int end)>();
+        var usingOpenRx = new Regex(@"\bUSING\s*\(", RegexOptions.IgnoreCase);
+
+        foreach (Match m in usingOpenRx.Matches(sql))
+        {
+            int open = m.Index + m.Value.LastIndexOf('(');
+            int depth = 1;
+
+            for (int i = open + 1; i < sql.Length; i++)
+            {
+                char c = sql[i];
+                if (c == '(') depth++;
+                else if (c == ')')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        spans.Add((open, i));
+                        break;
+                    }
+                }
+            }
+        }
+
+        return spans;
+    }
+
+    private static bool IsInsideAny(int index, List<(int start, int end)> spans)
+        => spans.Any(s => index >= s.start && index <= s.end);
 }
